@@ -7,74 +7,57 @@ from datetime import datetime
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
+# ── MSTR 持仓常量（来自 strategy.com/shares 官方数据）──────
+# 更新日期: 2026-05-25
+MSTR_BTC_HOLDINGS = 843_738          # MSTR持有BTC数量
+MSTR_DILUTED_SHARES = 381_954_000    # 稀释股本（股）
+
 # ── 数据获取函数 ──────────────────────────────────────
 
 def get_btc_price():
-    """换成 CoinGecko 公开 API，彻底解决 GitHub Actions 的 451 锁 IP 问题"""
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "ids": "bitcoin",
-        "order": "market_cap_desc",
-        "per_page": 1,
-        "page": 1,
-        "sparkline": "false",
-        "price_change_percentage": "24h"
-    }
-    r = requests.get(url, params=params, timeout=10)
+    """Binance 公开 API，无需 key"""
+    r = requests.get(
+        "https://api.binance.com/api/v3/ticker/24hr",
+        params={"symbol": "BTCUSDT"},
+        timeout=10,
+    )
     r.raise_for_status()
-    d = r.json()[0]
-    
-    price = float(d["current_price"])
-    change = float(d["price_change_percentage_24h"])
-    volume = float(d["total_volume"])  # USD 计价成交量
+    d = r.json()
+    price = float(d["lastPrice"])
+    change = float(d["priceChangePercent"])
+    volume = float(d["quoteVolume"])
     return price, change, volume
 
 
 def get_fear_greed():
-    """Alternative.me 免费 API，行业标准"""
+    """Alternative.me 免费 API"""
     r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
     r.raise_for_status()
     d = r.json()["data"][0]
-    value = int(d["value"])
-    label = d["value_classification"]
-    return value, label
+    return int(d["value"]), d["value_classification"]
 
 
 def get_mstr_price():
-    """Yahoo Finance 非官方 API，免费无 key"""
+    """Yahoo Finance 非官方 API"""
     url = "https://query1.finance.yahoo.com/v8/finance/chart/MSTR"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     r = requests.get(url, headers=headers, timeout=10)
     r.raise_for_status()
     meta = r.json()["chart"]["result"][0]["meta"]
     price = meta["regularMarketPrice"]
-    prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
-    change_pct = (price - prev_close) / prev_close * 100
+    prev = meta.get("previousClose") or meta.get("chartPreviousClose")
+    change_pct = (price - prev) / prev * 100
     return price, change_pct
 
 
-def get_mnav():
-    """从 saylortracker 抓取最新 mNAV 数值"""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-
-        # 先尝试抓主页，查找 mNAV 数值
-        r = requests.get("https://saylortracker.com/", headers=headers, timeout=15)
-        text = r.text
-
-        # 找 "0.98x" 格式或 JSON 格式的 navPremium
-        m = re.search(r'"navPremium"\s*:\s*([\d.]+)', text)
-        if m:
-            return float(m.group(1))
-
-        m = re.search(r'([\d.]+)x\s*(?:Multiple to Net Asset|mNAV)', text)
-        if m:
-            return float(m.group(1))
-
-    except Exception:
-        pass
-    return None
+def calc_mnav(mstr_price, btc_price):
+    """
+    自己算 mNAV，比爬网页稳100倍
+    公式：mNAV = MSTR市值 ÷ (持有BTC数量 × BTC价格)
+    """
+    mstr_market_cap = mstr_price * MSTR_DILUTED_SHARES
+    btc_nav = MSTR_BTC_HOLDINGS * btc_price
+    return mstr_market_cap / btc_nav
 
 
 # ── 格式化工具 ─────────────────────────────────────────
@@ -89,19 +72,18 @@ def emoji_change(pct):
 
 
 def emoji_fg(value):
-    if value <= 25: return "😱"   # 极度恐惧
-    if value <= 45: return "😨"   # 恐惧
-    if value <= 55: return "😐"   # 中性
-    if value <= 75: return "😏"   # 贪婪
-    return "🤑"                   # 极度贪婪
+    if value <= 25: return "😱"
+    if value <= 45: return "😨"
+    if value <= 55: return "😐"
+    if value <= 75: return "😏"
+    return "🤑"
 
 
 def mnav_label(v):
-    if v is None:  return "⚠️ 获取失败"
-    if v < 1.0:    return f"{v:.2f}x 🔵 折价中（低于净值，相对便宜）"
-    if v < 1.3:    return f"{v:.2f}x 🟡 小幅溢价"
-    if v < 1.8:    return f"{v:.2f}x 🟠 中度溢价"
-    return             f"{v:.2f}x 🔴 高度溢价，注意风险"
+    if v < 1.0:  return f"{v:.2f}x 🔵 折价（低于净值）"
+    if v < 1.3:  return f"{v:.2f}x 🟡 小幅溢价"
+    if v < 1.8:  return f"{v:.2f}x 🟠 中度溢价"
+    return           f"{v:.2f}x 🔴 高度溢价，注意风险"
 
 
 def build_message(btc_price, btc_change, btc_vol,
@@ -110,6 +92,7 @@ def build_message(btc_price, btc_change, btc_vol,
                   mnav):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     vol_b = btc_vol / 1e9
+    btc_nav_total = MSTR_BTC_HOLDINGS * btc_price / 1e9  # 十亿美元
 
     return f"""📊 *加密市场快报*
 🕐 {now}
@@ -129,6 +112,7 @@ def build_message(btc_price, btc_change, btc_vol,
 🏦 *MicroStrategy（MSTR）*
 💵 股价：${mstr_price:.2f}
 {emoji_change(mstr_change)} 日内涨跌：{mstr_change:+.2f}%
+🪙 持仓：{MSTR_BTC_HOLDINGS:,} BTC（${btc_nav_total:.1f}B）
 
 ━━━━━━━━━━━━━━━
 🔬 *mNAV 溢价*
@@ -154,7 +138,7 @@ def send_telegram(text):
 # ── 主流程 ────────────────────────────────────────────
 
 def main():
-    print("📡 获取比特币价格（CoinGecko）...")
+    print("📡 获取比特币价格（Binance）...")
     btc_price, btc_change, btc_vol = get_btc_price()
     print(f"   BTC: ${btc_price:,.0f}  {btc_change:+.2f}%")
 
@@ -166,9 +150,9 @@ def main():
     mstr_price, mstr_change = get_mstr_price()
     print(f"   MSTR: ${mstr_price:.2f}  {mstr_change:+.2f}%")
 
-    print("📡 获取 mNAV（saylortracker）...")
-    mnav = get_mnav()
-    print(f"   mNAV: {mnav}")
+    print("🧮 计算 mNAV...")
+    mnav = calc_mnav(mstr_price, btc_price)
+    print(f"   mNAV: {mnav:.3f}x")
 
     msg = build_message(btc_price, btc_change, btc_vol,
                         fg_value, fg_label,
