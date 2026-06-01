@@ -164,13 +164,42 @@ def get_btc_holdings_from_sec():
 
 # ── 计算指标 ───────────────────────────────────────────
 
+def get_sats_per_share_from_web():
+    """
+    直接从 saylortracker 抓 Sats per Diluted Share
+    就是页面最显眼那个大数字，最准确
+    """
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        r = requests.get("https://saylortracker.com/", headers=headers, timeout=15)
+        text = r.text
+        # 找类似 220,429 这样的 sats 数值
+        m = re.search(r'"satsPerShare"\s*:\s*([\d.]+)', text)
+        if m:
+            return int(float(m.group(1)))
+        m = re.search(r'"satoshisPerShare"\s*:\s*([\d.]+)', text)
+        if m:
+            return int(float(m.group(1)))
+    except Exception:
+        pass
+    return None
+
+
 def calc_metrics(mstr_price, shares_basic, btc_holdings, btc_price):
     btc_nav        = btc_holdings * btc_price
-    # 稀释股本 = 基础股本 × 1.087（历史稳定比例，保守估算）
+    # 稀释股本 = 基础股本 × 1.087（用于算 mNAV）
     shares_diluted = int(shares_basic * 1.087)
     mstr_mktcap    = mstr_price * shares_diluted
     mnav           = mstr_mktcap / btc_nav
-    sats_per_share = int(btc_holdings * 100_000_000 / shares_basic)
+
+    # Sats/Share 优先从 saylortracker 抓（Diluted 口径），抓不到自己算
+    sats_per_share = get_sats_per_share_from_web()
+    if sats_per_share is None:
+        sats_per_share = int(btc_holdings * 100_000_000 / shares_diluted)
+        print(f"   Sats/Share 用稀释股本自算: {sats_per_share:,}")
+    else:
+        print(f"   Sats/Share 来自 saylortracker: {sats_per_share:,}")
+
     return mnav, sats_per_share, btc_nav
 
 
@@ -296,3 +325,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
