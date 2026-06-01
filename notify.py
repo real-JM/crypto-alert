@@ -10,14 +10,24 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 # ── 数据获取函数 ──────────────────────────────────────
 
 def get_btc_price():
-    """Binance 公开 API，无需 key，最稳定"""
-    url = "https://api.binance.com/api/v3/ticker/24hr"
-    r = requests.get(url, params={"symbol": "BTCUSDT"}, timeout=10)
+    """换成 CoinGecko 公开 API，彻底解决 GitHub Actions 的 451 锁 IP 问题"""
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "ids": "bitcoin",
+        "order": "market_cap_desc",
+        "per_page": 1,
+        "page": 1,
+        "sparkline": "false",
+        "price_change_percentage": "24h"
+    }
+    r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
-    d = r.json()
-    price = float(d["lastPrice"])
-    change = float(d["priceChangePercent"])
-    volume = float(d["quoteVolume"])  # USDT 计价成交量
+    d = r.json()[0]
+    
+    price = float(d["current_price"])
+    change = float(d["price_change_percentage_24h"])
+    volume = float(d["total_volume"])  # USD 计价成交量
     return price, change, volume
 
 
@@ -144,7 +154,7 @@ def send_telegram(text):
 # ── 主流程 ────────────────────────────────────────────
 
 def main():
-    print("📡 获取比特币价格（Binance）...")
+    print("📡 获取比特币价格（CoinGecko）...")
     btc_price, btc_change, btc_vol = get_btc_price()
     print(f"   BTC: ${btc_price:,.0f}  {btc_change:+.2f}%")
 
