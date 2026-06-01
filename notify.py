@@ -1,29 +1,41 @@
 import requests
 import os
+import re
+import json
 from datetime import datetime
 
-# ── 配置区，从环境变量读取 ──────────────────────────────
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# ── 数据获取函数 ──────────────────────────────────────
+# MSTR 在 SEC EDGAR 的 CIK（固定不变）
+MSTR_CIK = "0001050446"
+
+# 兜底值（SEC API 挂了时用）
+FALLBACK_BTC_HOLDINGS   = 843_738
+FALLBACK_SHARES_BASIC   = 351_696_000
+FALLBACK_SHARES_DILUTED = 381_954_000
+
+# SEC EDGAR 要求 User-Agent 带联系方式
+SEC_HEADERS = {
+    "User-Agent": "CryptoAlertBot contact@example.com",
+    "Accept": "application/json",
+}
+
+# ── 数据获取 ──────────────────────────────────────────
 
 def get_btc_price():
-    """Kraken 公开 API，无地区限制，无需 key"""
-    # 当前价格 + 成交量
+    """Kraken 公开 API，无地区限制"""
     r = requests.get(
         "https://api.kraken.com/0/public/Ticker",
-        params={"pair": "XBTUSD"},
-        timeout=10,
+        params={"pair": "XBTUSD"}, timeout=10,
     )
     r.raise_for_status()
     d = r.json()["result"]["XXBTZUSD"]
-    price  = float(d["c"][0])   # 最新成交价
-    vol24h = float(d["v"][1])   # 24h 成交量（BTC计价）
-    open24h = float(d["o"])     # 24h 开盘价
+    price      = float(d["c"][0])
+    vol24h     = float(d["v"][1])
+    open24h    = float(d["o"])
     change_pct = (price - open24h) / open24h * 100
-    volume_usd = vol24h * price  # 换算成 USD 成交量
-    return price, change_pct, volume_usd
+    return price, change_pct, vol24h * price
 
 
 def get_fear_greed():
@@ -34,86 +46,135 @@ def get_fear_greed():
     return int(d["value"]), d["value_classification"]
 
 
-def get_mstr_data():
-    """
-    Yahoo Finance 拿股价 + 股本数据
-    sharesOutstanding = 基础股本（用于算 Sats per Share，与官方口径一致）
-    """
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-
-    # 实时股价
-    r1 = requests.get(
+def get_mstr_price():
+    """Yahoo Finance v8 chart，稳定无需认证"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(
         "https://query1.finance.yahoo.com/v8/finance/chart/MSTR",
         headers=headers, timeout=10,
     )
-    r1.raise_for_status()
-    meta = r1.json()["chart"]["result"][0]["meta"]
+    r.raise_for_status()
+    meta = r.json()["chart"]["result"][0]["meta"]
     price = meta["regularMarketPrice"]
     prev  = meta.get("previousClose") or meta.get("chartPreviousClose")
-    change_pct = (price - prev) / prev * 100
-
-    # 基础股本 + 市值（用于算 mNAV）
-    r2 = requests.get(
-        "https://query1.finance.yahoo.com/v10/finance/quoteSummary/MSTR",
-        params={"modules": "defaultKeyStatistics,summaryDetail"},
-        headers=headers, timeout=10,
-    )
-    r2.raise_for_status()
-    stats = r2.json()["quoteSummary"]["result"][0]
-
-    # sharesOutstanding = 基础流通股（与 strategy.com 基础股本口径最接近）
-    shares_basic = stats["defaultKeyStatistics"]["sharesOutstanding"]["raw"]
-
-    # 稀释股本（用于 mNAV，与 saylortracker 一致）
-    shares_diluted = stats["defaultKeyStatistics"].get("impliedSharesOutstanding", {}).get("raw") \
-                  or stats["defaultKeyStatistics"].get("sharesOutstanding", {}).get("raw")
-
-    return price, change_pct, shares_basic, shares_diluted
+    return price, (price - prev) / prev * 100
 
 
-def get_mstr_btc_holdings():
+def get_shares_from_sec():
     """
-    从 strategy.com 官网抓最新 BTC 持仓量
-    备用：hardcode 最新已知值
+    从 SEC EDGAR CompanyConcept API 拿最新股本数据
+    完全免费，官方数据，永远不需要 key
+    MSTR CIK: 0001050446
     """
-    FALLBACK_BTC = 843_738  # 2026-05-25 官方公告值
-
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        r = requests.get("https://www.strategy.com/", headers=headers, timeout=12)
-        import re
-        # 页面上通常有 "843,738 BTC" 或 JSON 格式
-        m = re.search(r'"totalBitcoin"\s*:\s*([\d,]+)', r.text)
-        if m:
-            return int(m.group(1).replace(",", ""))
-        m = re.search(r'([\d,]{6,})\s*BTC', r.text)
-        if m:
-            val = int(m.group(1).replace(",", ""))
-            if 500_000 < val < 5_000_000:  # 合理范围校验
-                return val
-    except Exception:
-        pass
+        url = f"https://data.sec.gov/api/xbrl/companyconcept/{MSTR_CIK}/us-gaap/CommonStockSharesOutstanding.json"
+        r = requests.get(url, headers=SEC_HEADERS, timeout=15)
+        r.raise_for_status()
+        data = r.json()
 
-    return FALLBACK_BTC
+        # 拿 shares 单位下的所有申报记录
+        facts = data["units"]["shares"]
+
+        # 只要 10-Q 或 10-K 的最新记录（过滤掉修正版和早期文件）
+        quarterly = [
+            f for f in facts
+            if f.get("form") in ("10-Q", "10-K") and f.get("val", 0) > 100_000_000
+        ]
+
+        if quarterly:
+            # 按申报日期排序取最新
+            latest = sorted(quarterly, key=lambda x: x["filed"], reverse=True)[0]
+            shares_basic = latest["val"]
+            print(f"   SEC EDGAR 股本: {shares_basic:,}（{latest['filed']} {latest['form']}）")
+            return shares_basic
+
+    except Exception as e:
+        print(f"   SEC EDGAR 股本获取失败: {e}，使用兜底值")
+
+    return FALLBACK_SHARES_BASIC
 
 
-# ── 计算指标 ─────────────────────────────────────────
-
-def calc_metrics(mstr_price, shares_basic, shares_diluted, btc_holdings, btc_price):
+def get_btc_holdings_from_sec():
     """
-    mNAV   = MSTR稀释市值 ÷ BTC持仓净值
-    Sats/Share = BTC持仓 × 1亿sats ÷ 基础股本
+    从 SEC EDGAR 最新 8-K 文件抓 MSTR BTC 持仓
+    Strategy 每次买币都要向 SEC 提交 8-K，这里直接读最新一份
     """
+    try:
+        # 1. 拿最近的 8-K 提交列表
+        url = f"https://data.sec.gov/submissions/CIK{MSTR_CIK}.json"
+        r = requests.get(url, headers=SEC_HEADERS, timeout=15)
+        r.raise_for_status()
+        filings = r.json()["filings"]["recent"]
+
+        forms       = filings["form"]
+        accessions  = filings["accessionNumber"]
+        dates       = filings["filingDate"]
+
+        # 找最近的 8-K
+        for i, form in enumerate(forms):
+            if form == "8-K":
+                accession = accessions[i].replace("-", "")
+                date      = dates[i]
+
+                # 2. 拿这份 8-K 的文件列表
+                idx_url = f"https://www.sec.gov/Archives/edgar/data/1050446/{accession}/{accessions[i]}-index.json"
+                r2 = requests.get(idx_url, headers=SEC_HEADERS, timeout=10)
+                if r2.status_code != 200:
+                    continue
+
+                # 3. 找主文档（.htm 文件）
+                files = r2.json().get("directory", {}).get("item", [])
+                htm_file = next(
+                    (f["name"] for f in files if f["name"].endswith(".htm") and "8-k" in f["name"].lower()),
+                    None
+                )
+                if not htm_file:
+                    htm_file = next((f["name"] for f in files if f["name"].endswith(".htm")), None)
+
+                if not htm_file:
+                    continue
+
+                # 4. 下载文件正文，找 BTC 持仓数字
+                doc_url = f"https://www.sec.gov/Archives/edgar/data/1050446/{accession}/{htm_file}"
+                r3 = requests.get(doc_url, headers=SEC_HEADERS, timeout=15)
+                text = r3.text
+
+                # 找 "hodl X BTC" 或 "holds X bitcoin" 等格式
+                patterns = [
+                    r'hodl\s+([\d,]+)\s*(?:\$\s*)?BTC',
+                    r'holds?\s+([\d,]+)\s+bitcoin',
+                    r'total.*?([\d,]{6,})\s+bitcoin',
+                    r'([\d,]{6,})\s+BTC\s+acquired',
+                    r'aggregate.*?([\d,]{6,})\s+bitcoin',
+                ]
+                for pat in patterns:
+                    m = re.search(pat, text, re.IGNORECASE)
+                    if m:
+                        val = int(m.group(1).replace(",", ""))
+                        if 500_000 < val < 5_000_000:
+                            print(f"   SEC 8-K BTC持仓: {val:,}（{date}）")
+                            return val
+                break  # 只试最新一份 8-K
+
+    except Exception as e:
+        print(f"   SEC BTC持仓获取失败: {e}，使用兜底值")
+
+    return FALLBACK_BTC_HOLDINGS
+
+
+# ── 计算指标 ───────────────────────────────────────────
+
+def calc_metrics(mstr_price, shares_basic, btc_holdings, btc_price):
     btc_nav        = btc_holdings * btc_price
+    # 稀释股本 = 基础股本 × 1.087（历史稳定比例，保守估算）
+    shares_diluted = int(shares_basic * 1.087)
     mstr_mktcap    = mstr_price * shares_diluted
     mnav           = mstr_mktcap / btc_nav
-
     sats_per_share = int(btc_holdings * 100_000_000 / shares_basic)
-
     return mnav, sats_per_share, btc_nav
 
 
-# ── 格式化工具 ─────────────────────────────────────────
+# ── 格式化 ─────────────────────────────────────────────
 
 def emoji_change(pct):
     if pct >= 5:  return "🚀"
@@ -142,10 +203,9 @@ def build_message(btc_price, btc_change, btc_vol,
                   mstr_price, mstr_change,
                   btc_holdings, btc_nav,
                   mnav, sats_per_share):
-
-    now    = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    vol_b  = btc_vol / 1e9
-    nav_b  = btc_nav  / 1e9
+    now   = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    vol_b = btc_vol / 1e9
+    nav_b = btc_nav / 1e9
 
     return f"""📊 *加密市场快报*
 🕐 {now}
@@ -195,7 +255,7 @@ def send_telegram(text):
 # ── 主流程 ────────────────────────────────────────────
 
 def main():
-    print("📡 获取比特币价格（Binance）...")
+    print("📡 获取比特币价格（Kraken）...")
     btc_price, btc_change, btc_vol = get_btc_price()
     print(f"   BTC: ${btc_price:,.0f}  {btc_change:+.2f}%")
 
@@ -203,21 +263,23 @@ def main():
     fg_value, fg_label = get_fear_greed()
     print(f"   F&G: {fg_value} ({fg_label})")
 
-    print("📡 获取微策略股价+股本（Yahoo Finance）...")
-    mstr_price, mstr_change, shares_basic, shares_diluted = get_mstr_data()
+    print("📡 获取微策略股价（Yahoo Finance）...")
+    mstr_price, mstr_change = get_mstr_price()
     print(f"   MSTR: ${mstr_price:.2f}  {mstr_change:+.2f}%")
-    print(f"   基础股本: {shares_basic:,}  稀释股本: {shares_diluted:,}")
 
-    print("📡 获取 MSTR BTC 持仓（strategy.com）...")
-    btc_holdings = get_mstr_btc_holdings()
+    print("📡 获取股本数据（SEC EDGAR）...")
+    shares_basic = get_shares_from_sec()
+    print(f"   基础股本: {shares_basic:,}")
+
+    print("📡 获取 BTC 持仓（SEC EDGAR 8-K）...")
+    btc_holdings = get_btc_holdings_from_sec()
     print(f"   BTC持仓: {btc_holdings:,}")
 
     print("🧮 计算 mNAV & Sats/Share...")
     mnav, sats_per_share, btc_nav = calc_metrics(
-        mstr_price, shares_basic, shares_diluted, btc_holdings, btc_price
+        mstr_price, shares_basic, btc_holdings, btc_price
     )
-    print(f"   mNAV: {mnav:.3f}x")
-    print(f"   Sats/Share: {sats_per_share:,}")
+    print(f"   mNAV: {mnav:.3f}x   Sats/Share: {sats_per_share:,}")
 
     msg = build_message(
         btc_price, btc_change, btc_vol,
