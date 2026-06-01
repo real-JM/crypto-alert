@@ -9,15 +9,21 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 # ── 数据获取函数 ──────────────────────────────────────
 
 def get_btc_price():
-    """Binance 公开 API，无需 key"""
+    """Kraken 公开 API，无地区限制，无需 key"""
+    # 当前价格 + 成交量
     r = requests.get(
-        "https://api.binance.com/api/v3/ticker/24hr",
-        params={"symbol": "BTCUSDT"},
+        "https://api.kraken.com/0/public/Ticker",
+        params={"pair": "XBTUSD"},
         timeout=10,
     )
     r.raise_for_status()
-    d = r.json()
-    return float(d["lastPrice"]), float(d["priceChangePercent"]), float(d["quoteVolume"])
+    d = r.json()["result"]["XXBTZUSD"]
+    price  = float(d["c"][0])   # 最新成交价
+    vol24h = float(d["v"][1])   # 24h 成交量（BTC计价）
+    open24h = float(d["o"])     # 24h 开盘价
+    change_pct = (price - open24h) / open24h * 100
+    volume_usd = vol24h * price  # 换算成 USD 成交量
+    return price, change_pct, volume_usd
 
 
 def get_fear_greed():
